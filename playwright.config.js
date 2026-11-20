@@ -1,4 +1,3 @@
-
 const { defineConfig } = require('@playwright/test');
 
 module.exports = defineConfig({
@@ -9,8 +8,20 @@ module.exports = defineConfig({
 
   retries: 0,
 
+  // Disable test timeout to support infinite batch looping
+  timeout: 0,
+
   use: {
     headless: true,
-    browserName: 'chromium'
+    browserName: 'chromium',
+    launchOptions: {
+      args: [
+        '--autoplay-policy=no-user-gesture-required',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--mute-audio'
+      ]
+    }
   }
 });
