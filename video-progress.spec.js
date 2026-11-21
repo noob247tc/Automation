@@ -1,9 +1,27 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('fs');
+const path = require('path');
 
 const TARGET_URL = 'https://cb3newsmonitoringdashboard.lovable.app/lokal/langtad';
-// Batch size defaults to 45 tabs (configurable via TABS=... environment variable)
+// Maintain 45 concurrent tabs running (configurable via TABS=... environment variable)
 const TAB_COUNT = parseInt(process.env.TABS || '45', 10);
+
+/**
+ * Removes all screenshot image files from the screenshots folder
+ */
+function clearScreenshots() {
+  const dir = path.join(__dirname, 'screenshots');
+  if (fs.existsSync(dir)) {
+    const files = fs.readdirSync(dir);
+    for (const file of files) {
+      if (/\.(png|jpe?g)$/i.test(file)) {
+        try {
+          fs.unlinkSync(path.join(dir, file));
+        } catch (e) {}
+      }
+    }
+  }
+}
 
 /**
  * Ensures YouTube embed starts playing and runs at max supported speed (2.0x)
@@ -74,11 +92,11 @@ async function startYouTubePlayback(page, iframe, player, video, prefix) {
     }
   ).toBe(true);
 
-  console.log(`${prefix} Playback confirmed at 2.0x speed.`);
+  console.log(`${prefix} Playback active at 2.0x.`);
 }
 
-async function runVideoSession(page, index, batch) {
-  const prefix = `[Batch ${batch} | Tab ${index}]`;
+async function runVideoSession(page, slotIndex, sessionCount) {
+  const prefix = `[Slot ${slotIndex} | #${sessionCount}]`;
   console.log(`${prefix} Opening dashboard...`);
 
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
@@ -130,61 +148,71 @@ async function runVideoSession(page, index, batch) {
   ).toBe(true);
 
   console.log(`${prefix} Full-view confirmation achieved.`);
-  await page.screenshot({
-    path: `screenshots/batch-${batch}-tab-${index}-confirmed.png`,
-    fullPage: true
-  }).catch(() => {});
 }
 
-test('Play and monitor full-view confirmation infinitely in batches', async ({ browser }) => {
-  test.setTimeout(0); // 0 disables test timeout so the infinite loop never gets killed
-  fs.mkdirSync('screenshots', { recursive: true });
-
-  let batch = 1;
+/**
+ * An independent worker slot that maintains 1 active tab at all times.
+ * When a session finishes, it closes the tab and immediately launches a new one.
+ */
+async function workerSlot(browser, slotIndex) {
+  let sessionCount = 1;
 
   while (true) {
-    console.log(`\n==================================================`);
-    console.log(`[STARTING BATCH ${batch}] Launching ${TAB_COUNT} concurrent tabs...`);
-    console.log(`==================================================\n`);
+    const prefix = `[Slot ${slotIndex} | #${sessionCount}]`;
+    let context;
+    let page;
 
-    // Create a dedicated browser context for each batch to completely free memory between batches
-    const context = await browser.newContext();
-    const pages = [];
+    try {
+      // Create isolated context per session to release memory & cache completely
+      context = await browser.newContext();
+      page = await context.newPage();
 
-    for (let i = 1; i <= TAB_COUNT; i++) {
-      const page = await context.newPage();
-      pages.push({ page, index: i });
+      await runVideoSession(page, slotIndex, sessionCount);
+    } catch (err) {
+      console.error(`${prefix} Error:`, err.message);
+      if (page) {
+        await page.screenshot({
+          path: `screenshots/slot-${slotIndex}-session-${sessionCount}-failed.png`,
+          fullPage: true
+        }).catch(() => {});
+      }
+    } finally {
+      // Close the tab and context immediately when done to free RAM
+      if (page) {
+        await page.close().catch(() => {});
+      }
+      if (context) {
+        await context.close().catch(() => {});
+      }
+      // Clean up screenshots periodically to keep disk space free
+      clearScreenshots();
+      sessionCount++;
     }
 
-    // Run all tabs concurrently in this batch
-    const tasks = pages.map(({ page, index }) =>
-      runVideoSession(page, index, batch)
-        .catch(async (err) => {
-          console.error(`[Batch ${batch} | Tab ${index}] Error:`, err.message);
-          await page.screenshot({
-            path: `screenshots/batch-${batch}-tab-${index}-failed.png`,
-            fullPage: true
-          }).catch(() => {});
-        })
-        .finally(async () => {
-          // Close each tab once its session is finished to free RAM immediately
-          await page.close().catch(() => {});
-        })
-    );
-
-    // Wait for all tabs in the current batch to finish
-    await Promise.allSettled(tasks);
-
-    console.log(`\n==================================================`);
-    console.log(`[BATCH ${batch} COMPLETE] All ${TAB_COUNT} tabs finished. Clearing memory...`);
-    console.log(`==================================================\n`);
-
-    // Close the entire context to wipe cache/storage and prevent memory leaks
-    await context.close().catch(() => {});
-
-    batch++;
-
-    console.log(`Starting next batch in 3 seconds...`);
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    // Immediate continuation into the next session
+    console.log(`${prefix} Finished. Starting replacement tab immediately...`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
+}
+
+test('Maintain continuous pool of concurrent tabs running infinitely', async ({ browser }) => {
+  test.setTimeout(0); // 0 disables test timeout so it runs indefinitely
+  fs.mkdirSync('screenshots', { recursive: true });
+  clearScreenshots();
+
+  console.log(`\n==================================================`);
+  console.log(`Starting ${TAB_COUNT} continuous rolling workers...`);
+  console.log(`Each finished tab will immediately be replaced by a new tab.`);
+  console.log(`==================================================\n`);
+
+  // Launch TAB_COUNT independent workers with a slight stagger so the initial batch doesn't spike CPU/network
+  const workers = Array.from({ length: TAB_COUNT }, async (_, i) => {
+    if (i > 0) {
+      await new Promise((resolve) => setTimeout(resolve, i * 600));
+    }
+    return workerSlot(browser, i + 1);
+  });
+
+  // Keep all workers running in parallel forever
+  await Promise.all(workers);
 });
